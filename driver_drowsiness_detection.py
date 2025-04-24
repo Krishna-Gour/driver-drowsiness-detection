@@ -6,6 +6,7 @@ import pygame
 import threading
 from scipy.spatial.transform import Rotation as R
 import csv
+from synthetic_data_generator import SyntheticSmartwatchDataGenerator
 
 # Initialize Pygame for alert sound
 pygame.mixer.init()
@@ -19,6 +20,9 @@ face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refi
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 MOUTH = [78, 81, 13, 311, 308, 402]
+
+# Initialize synthetic data generator (minimal integration)
+smartwatch_generator = SyntheticSmartwatchDataGenerator()
 
 # Function to calculate EAR (Eye Aspect Ratio)
 def calculate_ear(eye_landmarks):
@@ -73,6 +77,12 @@ def get_head_pose(face_landmarks, frame_shape):
     _, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, None)
     return rotation_vector, translation_vector
 
+# Function to confirm drowsiness with physiological data
+def confirm_with_physiological_data():
+    """Get current physiological state (only called when visual detection is uncertain)"""
+    data = smartwatch_generator.generate_data(duration_minutes=0.1, frequency_hz=1).iloc[-1]
+    return data['state'] == 'drowsy'
+
 # Capture video
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -121,6 +131,7 @@ mar_history = []
 history_length = 10
 frame_counter = 0
 skip_frames = 2
+uncertainty_counter = 0  # Counts frames where visual detection is uncertain
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -166,8 +177,20 @@ while cap.isOpened():
             cv2.putText(frame, f'EAR: {smoothed_ear:.2f}', (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(frame, f'MAR: {smoothed_mar:.2f}', (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # Drowsiness detection based on EAR
-            if smoothed_ear < ear_threshold:
+            # Visual drowsiness detection (primary system)
+            visual_confidence = 1.0  # 1.0 = high confidence, 0.0 = uncertain
+            
+            # Reduce confidence if EAR is near threshold
+            if abs(smoothed_ear - ear_threshold) < 0.05:
+                visual_confidence = 0.5
+            
+            # Reduce confidence if lighting is poor (estimated by landmark visibility)
+            landmark_visibility = np.mean([face_landmarks.landmark[i].visibility for i in [1, 33, 61, 291, 199, 425]])
+            if landmark_visibility < 0.5:
+                visual_confidence *= 0.7
+            
+            # Drowsiness detection based on EAR (high confidence)
+            if smoothed_ear < ear_threshold and visual_confidence > 0.7:
                 if ear_below_threshold_start is None:
                     ear_below_threshold_start = time.time()
                 elif time.time() - ear_below_threshold_start >= drowsy_time:
@@ -176,6 +199,18 @@ while cap.isOpened():
                     log_event("Drowsiness", smoothed_ear, smoothed_mar)
             else:
                 ear_below_threshold_start = None
+            
+            # Low confidence visual detection - use physiological confirmation
+            if smoothed_ear < ear_threshold and visual_confidence <= 0.7:
+                uncertainty_counter += 1
+                if uncertainty_counter > 10:  # After 10 uncertain frames, check physiological data
+                    if confirm_with_physiological_data():
+                        cv2.putText(frame, "DROWSINESS CONFIRMED!", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                        threading.Thread(target=play_alert, daemon=True).start()
+                        log_event("Drowsiness (Confirmed)", smoothed_ear, smoothed_mar)
+                    uncertainty_counter = 0
+            else:
+                uncertainty_counter = 0
 
             # Yawning detection based on MAR
             if smoothed_mar > mar_threshold:
